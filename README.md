@@ -14,9 +14,33 @@ Warden modules are native x86 code the server streams to the client and the
 client **executes** — but only after verifying an RSA-2048 signature against a
 public modulus baked into `WoW.exe` (`.rdata`). If a private-server client ships
 a **replaced** modulus, that server holds the matching private key and can sign
-and run **arbitrary native code on the player's machine** (remote code
-execution). This tool checks whether the legitimate key is still the one in the
-binary.
+and load its **own native module**, running **arbitrary native code on the
+player's machine** (remote code execution). This tool checks whether the
+legitimate key is still the one in the binary.
+
+### What a genuine key does and does not protect against
+
+This is the important nuance (and a correction to an earlier framing of this
+project):
+
+- **Genuine key present → no native-code channel.** A server cannot forge a
+  custom native module without the matching private key, so it cannot run
+  arbitrary native code on you. This is the case wardencheck calls **SAFE**.
+- **But a genuine key is not "the server can't touch your client."** Using
+  Blizzard's *own* signed module, a server can still issue legitimate Warden
+  checks — reading client memory and running **sandboxed Lua** strings. That
+  Lua channel is exactly how patch-less custom servers (e.g. **AzerothCore**,
+  via its Warden payload manager) add custom UI/content, and it requires **no
+  key swap**. It runs in the client's Lua sandbox, not as native code.
+- **Replaced key → full native RCE.** Only a swapped modulus lets a server sign
+  its *own* native module and execute arbitrary native code — far beyond the
+  sandboxed Lua/memory checks the genuine module allows. That is the (relatively
+  uncommon) condition wardencheck flags as **DANGER**.
+
+So wardencheck answers one specific question — "can this client's server run
+arbitrary *native* code via a replaced Warden key?" — not "can the server
+influence my client at all." Sandboxed Lua via the genuine module is expected
+and is not flagged.
 
 ## Why it is cross-version
 

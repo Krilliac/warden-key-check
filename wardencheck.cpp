@@ -6,9 +6,17 @@
 //   Warden modules are native x86 code the server sends and the client *executes*
 //   after verifying an RSA-2048 signature against a public modulus embedded in
 //   WoW.exe (.rdata). If a custom/private-server client ships a *replaced* modulus
-//   (attacker-controlled key), that server can sign and run ARBITRARY native code
-//   on the player's machine (remote code execution). This tool checks whether the
-//   genuine Blizzard Warden key is the one embedded in a given client binary.
+//   (attacker-controlled key), that server can sign and load its OWN native module
+//   and run ARBITRARY native code on the player's machine (remote code execution).
+//   This tool checks whether the genuine Blizzard Warden key is still embedded.
+//
+//   SCOPE (important): a genuine key only rules out the *native-code* channel.
+//   With Blizzard's own signed module a server can still issue legitimate checks -
+//   reading client memory and running SANDBOXED Lua strings. That Lua path is how
+//   patch-less custom servers (e.g. AzerothCore's Warden payload manager) add
+//   content, and it needs NO key swap. So a replaced key = native RCE (DANGER);
+//   a genuine key = no native RCE (SAFE), though sandboxed Lua/memory checks via
+//   the legit module are still possible and expected.
 //
 // WHY IT'S CROSS-VERSION
 //   Blizzard reused the SAME Warden public key across 1.12.1 / 2.4.3 / 3.3.5a.
@@ -783,6 +791,11 @@ static ScanResult computeScan(const std::vector<uint8_t>& b, const Reference& r,
             : "No direct code xref found (inconclusive - indirect addressing is normal; no foreign "
               "key is referenced either, so no tamper signal). The client is modified (hash not in "
               "the known-good list) but the Warden key itself is intact.";
+        res.detail += " Scope: a genuine key means the server cannot forge a custom native Warden "
+                      "module, so there is NO arbitrary native-code (RCE) channel. It can still issue "
+                      "legitimate checks through Blizzard's signed module - reading client memory and "
+                      "running SANDBOXED Lua (standard anti-cheat, and how patch-less custom servers "
+                      "like AzerothCore add content). That is expected, not the RCE this tool flags.";
         return res;
     }
 
@@ -792,8 +805,10 @@ static ScanResult computeScan(const std::vector<uint8_t>& b, const Reference& r,
         res.verdict = "DANGER"; res.exitCode = 2; res.liveKey = live.foreign.empty() ? "n/a" : "foreign";
         res.reason = "Warden key was REPLACED. Do NOT connect with this client.";
         res.detail = "The genuine Blizzard key is absent and a different RSA-2048 key is embedded. A "
-                     "server using this client can sign and EXECUTE arbitrary native code on your "
-                     "machine (remote code execution).";
+                     "replaced key lets a server sign and load its OWN native Warden module and EXECUTE "
+                     "arbitrary native code on your machine (full RCE) - far beyond the sandboxed Lua "
+                     "and memory checks the genuine module allows. This is NOT how normal custom "
+                     "servers work; they keep the genuine key.";
         if (!live.foreign.empty())
             for (const auto& k : live.foreign)
                 res.foreignKeys.push_back({toHex(k.sha), k.va, k.fileOff, true});
