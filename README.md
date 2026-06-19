@@ -83,6 +83,31 @@ Options:
 | `--manifest <path>`| community known-good hash list (default: `wardencheck.manifest`) |
 | `--offset <hexVA>` | pin: read the modulus from an explicit virtual address        |
 | `--pick <N>`       | pin: choose candidate N when several are found                |
+| `--json`           | scan: emit one machine-readable JSON object (for bots/CI)     |
+
+### Machine-readable output (`scan --json`)
+
+For wiring into a Discord bot or CI gate, `scan --json` prints a single JSON
+object (and still sets the 0/2/3 exit code):
+
+```json
+{"verdict":"DANGER","exit_code":2,"file_sha256":"…","pinned":true,
+ "key_present":true,"reversed_match":false,"live_key":"foreign",
+ "matched_good_hash":false,"matched_manifest":false,
+ "reason":"Genuine key is present but a FOREIGN key is wired in. Do NOT connect.",
+ "foreign_keys":[{"sha256":"…","code_referenced":true,"va":4202880,"file_offset":1408}]}
+```
+
+### Exact, build-portable pinning
+
+`pin` resolves the **exact** 256-byte key by snapping to the address the verify
+code references, rather than a content window that might include adjacent
+build-specific bytes. That exactness is what makes a single pin genuinely match
+the *same shared key* in every build (1.12.1 → 3.3.5a); a filler-contaminated
+pin would fail to match a different legitimate build and raise a false DANGER.
+If no code reference is found, it falls back to the content heuristic and warns
+that the boundaries are unconfirmed. `scan` also matches the key in either byte
+order, so a build that stores it LE-vs-BE is not mistaken for a replacement.
 
 ### Known-good manifest
 
@@ -142,11 +167,18 @@ synthetic PE. Exit code `0` means all checks passed — handy as a CI smoke test
 
 ## Implemented in this version
 
+- **Exact, build-portable pinning** — pins the precise key the verify code
+  references, so one pin matches the shared key across every build (and won't
+  raise a false DANGER on a different legitimate build).
+- **Reversed byte-order match** — a build storing the key LE-vs-BE is not
+  mistaken for a replacement.
 - **Live-key cross-reference** — follows code pointers to confirm which modulus
   the verify path actually reads (catches the dual-key decoy).
+- **Machine-readable `--json`** — single JSON object for Discord-bot/CI wiring.
 - **Known-good manifest** — a distributable hash list so most users never pin
   (see `wardencheck.manifest`).
 - **Drag-and-drop** — drop a `WoW.exe` onto the executable; stays terminal-based.
+- **Built-in `selftest`** — 19 deterministic checks of the security-critical paths.
 
 ## Roadmap ideas
 

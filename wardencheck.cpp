@@ -579,6 +579,7 @@ static int cmdPin(const std::vector<uint8_t>& b, const std::string& refPath,
                   std::optional<uint64_t> vaOverride, std::optional<int> pick) {
     const PEInfo pe = parsePE(b);
     std::vector<uint8_t> modulus;
+    std::string pinSource;   // human-readable provenance of the pinned bytes
 
     if (vaOverride) {
         const auto off = vaToFileOffset(pe, b, *vaOverride);
@@ -588,35 +589,73 @@ static int cmdPin(const std::vector<uint8_t>& b, const std::string& refPath,
             return 1;
         }
         modulus.assign(b.begin() + *off, b.begin() + *off + MOD_BYTES);
+        pinSource = "explicit VA";
         std::cout << "Pinned modulus from explicit VA, fileOff=0x" << std::hex << *off << std::dec << "\n";
     } else {
-        const auto cands = findModulusCandidates(b, pe.rdataLo, pe.rdataHi);
-        if (cands.empty()) {
-            std::cerr << "error: no RSA-2048 modulus candidates found. This may be a packed or\n"
-                         "       heavily modified client. Re-run with --offset <hex VA> if you know it.\n";
-            return 1;
-        }
-        size_t idx = 0;
-        if (cands.size() > 1) {
-            if (!pick) {
-                std::cerr << "Multiple candidates found - re-run pin with --pick <N>:\n";
-                for (size_t i = 0; i < cands.size(); ++i)
-                    std::cerr << "    [" << i << "] fileOff=0x" << std::hex << cands[i].offset
-                              << std::dec << "  " << cands[i].endian
-                              << "  H=" << cands[i].entropy
-                              << "  sha256=" << toHex(cands[i].sha) << "\n";
+        // Prefer the EXACT key the verify code references: a code pointer lands
+        // on the true key start, so these bytes are the real 256-byte modulus -
+        // identical across builds (the shared key), which is what makes one pin
+        // cover every expansion. The content heuristic is a fallback only, since
+        // its window can include build-specific filler and would then fail to
+        // match a different legitimate build (a false DANGER).
+        const auto live = scanCodeReferencedKeys(b, pe, 0, 0);
+        if (!live.foreign.empty()) {
+            size_t idx = 0;
+            if (live.foreign.size() > 1) {
+                if (!pick) {
+                    std::cerr << "Multiple code-referenced keys found - re-run pin with --pick <N>:\n";
+                    for (size_t i = 0; i < live.foreign.size(); ++i)
+                        std::cerr << "    [" << i << "] VA=0x" << std::hex << live.foreign[i].va
+                                  << " fileOff=0x" << live.foreign[i].fileOff << std::dec
+                                  << "  sha256=" << toHex(live.foreign[i].sha) << "\n";
+                    return 1;
+                }
+                if (*pick < 0 || static_cast<size_t>(*pick) >= live.foreign.size()) {
+                    std::cerr << "error: --pick out of range (0.." << live.foreign.size()-1 << ")\n";
+                    return 1;
+                }
+                idx = static_cast<size_t>(*pick);
+            }
+            const auto& k = live.foreign[idx];
+            modulus.assign(b.begin() + k.fileOff, b.begin() + k.fileOff + MOD_BYTES);
+            pinSource = "code-referenced (exact)";
+            std::cout << "Pinned EXACT modulus from code-referenced VA=0x" << std::hex << k.va
+                      << " fileOff=0x" << k.fileOff << std::dec << "\n";
+        } else {
+            // Fallback: content heuristic. Warn that the pin is not code-confirmed.
+            const auto cands = findModulusCandidates(b, pe.rdataLo, pe.rdataHi);
+            if (cands.empty()) {
+                std::cerr << "error: no RSA-2048 modulus candidates found. This may be a packed or\n"
+                             "       heavily modified client. Re-run with --offset <hex VA> if you know it.\n";
                 return 1;
             }
-            if (*pick < 0 || static_cast<size_t>(*pick) >= cands.size()) {
-                std::cerr << "error: --pick out of range (0.." << cands.size()-1 << ")\n";
-                return 1;
+            size_t idx = 0;
+            if (cands.size() > 1) {
+                if (!pick) {
+                    std::cerr << "Multiple candidates found - re-run pin with --pick <N>:\n";
+                    for (size_t i = 0; i < cands.size(); ++i)
+                        std::cerr << "    [" << i << "] fileOff=0x" << std::hex << cands[i].offset
+                                  << std::dec << "  " << cands[i].endian
+                                  << "  H=" << cands[i].entropy
+                                  << "  sha256=" << toHex(cands[i].sha) << "\n";
+                    return 1;
+                }
+                if (*pick < 0 || static_cast<size_t>(*pick) >= cands.size()) {
+                    std::cerr << "error: --pick out of range (0.." << cands.size()-1 << ")\n";
+                    return 1;
+                }
+                idx = static_cast<size_t>(*pick);
             }
-            idx = static_cast<size_t>(*pick);
+            const auto& c = cands[idx];
+            modulus.assign(b.begin() + c.offset, b.begin() + c.offset + MOD_BYTES);
+            pinSource = "content heuristic (NOT code-confirmed)";
+            std::cout << "Pinned modulus from fileOff=0x" << std::hex << c.offset << std::dec
+                      << " (" << c.endian << ", H=" << c.entropy << ")\n";
+            std::cerr << "warning: no code reference to this key was found, so the exact byte\n"
+                         "         boundaries could not be confirmed. The pin may include adjacent\n"
+                         "         bytes and might not match a different build. Prefer pinning a\n"
+                         "         client whose verify code references the key, or use --offset.\n";
         }
-        const auto& c = cands[idx];
-        modulus.assign(b.begin() + c.offset, b.begin() + c.offset + MOD_BYTES);
-        std::cout << "Pinned modulus from fileOff=0x" << std::hex << c.offset << std::dec
-                  << " (" << c.endian << ", H=" << c.entropy << ")\n";
     }
 
     Reference r = loadRef(refPath);             // keep any existing good-hash list
@@ -631,6 +670,7 @@ static int cmdPin(const std::vector<uint8_t>& b, const std::string& refPath,
     if (!saveRef(refPath, r)) { std::cerr << "error: could not write " << refPath << "\n"; return 1; }
 
     std::cout << "Reference written: " << refPath << "\n";
+    std::cout << "  pin source     : " << pinSource << "\n";
     std::cout << "  modulus sha256 : " << r.modulusSha << "\n";
     std::cout << "  added goodhash : " << fileSha << "\n";
     std::cout << "This single reference now covers 1.12.1 / 2.4.3 / 3.3.5a (shared Blizzard key).\n";
@@ -650,125 +690,186 @@ static int cmdAddGood(const std::vector<uint8_t>& b, const std::string& refPath)
     return 0;
 }
 
-static int cmdScan(const std::vector<uint8_t>& b, const std::string& refPath,
-                   const std::string& manifestPath) {
-    Reference r = loadRef(refPath);
-    // Fold in distributable manifest hashes so most users never have to pin.
-    const auto manHashes = loadManifestGoodHashes(manifestPath);
-    for (const auto& h : manHashes)
-        if (std::find(r.goodHashes.begin(), r.goodHashes.end(), h) == r.goodHashes.end())
-            r.goodHashes.push_back(h);
+// A foreign key as surfaced in a verdict (code-referenced or content-only).
+struct ForeignKey {
+    std::string sha;          // hex sha256 of the 256 raw bytes
+    uint32_t    va = 0;       // 0 if content-only (no code reference)
+    size_t      fileOff = 0;
+    bool        codeReferenced = false;
+};
 
-    const std::string fileSha = toHex(sha::sha256(b.data(), b.size()));
+struct ScanResult {
+    std::string verdict;      // SAFE / DANGER / UNKNOWN
+    int         exitCode = 3;
+    std::string reason;       // one-line summary
+    std::string detail;       // longer human explanation
+    std::string fileSha;
+    bool        pinned = true;
+    bool        keyPresent = false;
+    bool        reversedMatch = false;   // genuine key found in opposite byte order
+    std::string liveKey = "n/a";         // genuine | foreign | indirect | n/a
+    bool        matchedGoodHash = false;
+    bool        matchedManifest = false;
+    std::vector<ForeignKey> foreignKeys;
+};
 
-    auto banner = [](const char* v, const char* msg){
-        std::cout << "\n========================================\n"
-                  << "  VERDICT: " << v << "\n"
-                  << "  " << msg << "\n"
-                  << "========================================\n";
-    };
+static ScanResult computeScan(const std::vector<uint8_t>& b, const Reference& r,
+                              const std::vector<std::string>& manHashes) {
+    ScanResult res;
+    res.fileSha = toHex(sha::sha256(b.data(), b.size()));
 
-    // 1) Strongest positive signal: exact match against a known-good client
-    //    (from the pinned ref or the community manifest).
-    if (std::find(r.goodHashes.begin(), r.goodHashes.end(), fileSha) != r.goodHashes.end()) {
-        banner("SAFE", "Exact match to a known-good client. Warden key is genuine.");
-        if (!manHashes.empty() &&
-            std::find(manHashes.begin(), manHashes.end(), fileSha) != manHashes.end())
-            std::cout << "matched         : community known-good manifest\n";
-        std::cout << "full-file sha256: " << fileSha << "\n";
-        return 0;
+    // 1) Strongest positive signal: exact match against a known-good client.
+    if (std::find(r.goodHashes.begin(), r.goodHashes.end(), res.fileSha) != r.goodHashes.end()) {
+        res.verdict = "SAFE"; res.exitCode = 0; res.keyPresent = true; res.liveKey = "genuine";
+        res.matchedGoodHash = true;
+        res.matchedManifest = std::find(manHashes.begin(), manHashes.end(), res.fileSha) != manHashes.end();
+        res.reason = "Exact match to a known-good client. Warden key is genuine.";
+        return res;
     }
 
     // Need a pinned reference modulus to judge unknown binaries.
     if (r.modulus.empty()) {
-        banner("UNKNOWN", "No reference pinned yet - cannot determine safety.");
-        std::cout << "Run:  wardencheck pin <a-client-you-trust>\n"
-                     "Verify that trusted client's full-file hash against community consensus first.\n"
-                     "One pin covers vanilla through WotLK.\n";
-        std::cout << "full-file sha256: " << fileSha << "\n";
-        return 3;
+        res.verdict = "UNKNOWN"; res.exitCode = 3; res.pinned = false;
+        res.reason = "No reference pinned yet - cannot determine safety.";
+        res.detail = "Run `wardencheck pin <a-client-you-trust>` (verify its hash against community "
+                     "consensus first). One pin covers vanilla through WotLK.";
+        return res;
     }
 
     const PEInfo pe = parsePE(b);
 
-    // 2) Content search: is the genuine Blizzard modulus embedded anywhere?
-    //    Version-agnostic by design (we match the key, not a fixed offset).
-    const auto it = std::search(b.begin(), b.end(), r.modulus.begin(), r.modulus.end());
-    const bool genuinePresent = (it != b.end());
+    // 2) Content search: is the genuine modulus embedded anywhere? We accept the
+    //    stored key in either byte order: builds may store the same key LE or BE,
+    //    and matching the reverse avoids a false DANGER on a legitimate variant.
+    auto it = std::search(b.begin(), b.end(), r.modulus.begin(), r.modulus.end());
+    if (it == b.end()) {
+        std::vector<uint8_t> rev(r.modulus.rbegin(), r.modulus.rend());
+        it = std::search(b.begin(), b.end(), rev.begin(), rev.end());
+        if (it != b.end()) res.reversedMatch = true;
+    }
+    res.keyPresent = (it != b.end());
 
     // Precise live-key resolution: follow code pointers to the keys they read.
-    // Establish the genuine key's VA span (if present) so pointers into it are
-    // recognized as the genuine key rather than misread as foreign.
     uint32_t genuineLoVA = 0, genuineHiVA = 0;
-    if (genuinePresent) {
+    if (res.keyPresent) {
         const size_t goff = static_cast<size_t>(it - b.begin());
         if (auto va = fileOffsetToVA(pe, goff)) { genuineLoVA = *va; genuineHiVA = *va + MOD_BYTES; }
     }
     const LiveKeyScan live = scanCodeReferencedKeys(b, pe, genuineLoVA, genuineHiVA);
 
-    if (genuinePresent) {
-        // 2a) Decoy / dual-key evasion: the genuine key is present, but executable
-        //     code references a DIFFERENT modulus and NOT the genuine one. We
-        //     escalate only on this POSITIVE foreign reference - an absent genuine
-        //     xref alone is inconclusive (indirect addressing is normal).
+    if (res.keyPresent) {
+        // 2a) Decoy / dual-key evasion: genuine key present, but code references a
+        //     DIFFERENT modulus and never the genuine one. Escalate only on this
+        //     positive foreign reference (absent genuine xref alone is inconclusive).
         if (!live.foreign.empty() && !live.genuineReferenced) {
-            banner("DANGER", "Genuine key is present but a FOREIGN key is wired in. Do NOT connect.");
-            std::cout << "The legitimate modulus exists in the file, yet executable code references a\n"
-                         "different RSA-2048 key and never the genuine one. This is the 'embed both,\n"
-                         "route to mine' pattern - the live verify path uses the attacker's key.\n";
-            std::cout << "code-referenced foreign key(s):\n";
+            res.verdict = "DANGER"; res.exitCode = 2; res.liveKey = "foreign";
+            res.reason = "Genuine key is present but a FOREIGN key is wired in. Do NOT connect.";
+            res.detail = "The legitimate modulus exists in the file, yet executable code references a "
+                         "different RSA-2048 key and never the genuine one (the 'embed both, route to "
+                         "mine' pattern). The live verify path uses the attacker's key.";
             for (const auto& k : live.foreign)
-                std::cout << "    VA=0x" << std::hex << k.va << " fileOff=0x" << k.fileOff << std::dec
-                          << "  sha256=" << toHex(k.sha) << "   (share to blocklist)\n";
-            std::cout << "full-file sha256 : " << fileSha << "\n";
-            return 2;
+                res.foreignKeys.push_back({toHex(k.sha), k.va, k.fileOff, true});
+            return res;
         }
-
-        banner("SAFE", "Genuine Blizzard Warden key is embedded in this client.");
-        std::cout << "Warden RSA key  : MATCHES trusted reference (server cannot forge modules).\n";
-        if (live.genuineReferenced)
-            std::cout << "live-key xref   : code references the genuine key directly (it is the key\n"
-                         "                  the verify path reads) and no foreign key is referenced.\n";
-        else
-            std::cout << "live-key xref   : none found (inconclusive - indirect addressing is normal;\n"
-                         "                  no foreign key is referenced either, so no tamper signal).\n";
-        std::cout << "Note            : full-file hash is not in your known-good list, so the\n"
-                     "                  client is modified (e.g. VanillaFixes/SuperWoW-style patch),\n"
-                     "                  but the Warden key itself is intact.\n";
-        std::cout << "full-file sha256: " << fileSha << "\n";
-        return 0;
+        res.verdict = "SAFE"; res.exitCode = 0;
+        res.liveKey = live.genuineReferenced ? "genuine" : "indirect";
+        res.reason = "Genuine Blizzard Warden key is embedded in this client.";
+        res.detail = live.genuineReferenced
+            ? "Code references the genuine key directly and no foreign key is referenced."
+            : "No direct code xref found (inconclusive - indirect addressing is normal; no foreign "
+              "key is referenced either, so no tamper signal). The client is modified (hash not in "
+              "the known-good list) but the Warden key itself is intact.";
+        return res;
     }
 
-    // 3) Blizzard key absent. Is a *foreign* RSA-2048 key sitting where the
-    //    Warden key belongs? That is the RCE-enabling tamper.
+    // 3) Genuine key absent. Is a foreign RSA-2048 key present where Warden's belongs?
     const auto cands = findModulusCandidates(b, pe.rdataLo, pe.rdataHi);
-    if (!cands.empty() || !live.foreign.empty()) {
-        banner("DANGER", "Warden key was REPLACED. Do NOT connect with this client.");
-        std::cout << "The genuine Blizzard key is absent and a different RSA-2048 key is embedded.\n"
-                     "A server using this client can sign and EXECUTE arbitrary native code on your\n"
-                     "machine (remote code execution). Only use the official client for this server.\n";
-        std::cout << "foreign key(s)  :\n";
-        // Prefer code-referenced keys (precise); fall back to content candidates.
-        const auto& list = !live.foreign.empty() ? live.foreign : std::vector<CodeKeyRef>{};
-        if (!list.empty()) {
-            for (const auto& k : list)
-                std::cout << "    VA=0x" << std::hex << k.va << " fileOff=0x" << k.fileOff << std::dec
-                          << "  code-referenced  sha256=" << toHex(k.sha) << "   (share to blocklist)\n";
-        } else {
+    if (!live.foreign.empty() || !cands.empty()) {
+        res.verdict = "DANGER"; res.exitCode = 2; res.liveKey = live.foreign.empty() ? "n/a" : "foreign";
+        res.reason = "Warden key was REPLACED. Do NOT connect with this client.";
+        res.detail = "The genuine Blizzard key is absent and a different RSA-2048 key is embedded. A "
+                     "server using this client can sign and EXECUTE arbitrary native code on your "
+                     "machine (remote code execution).";
+        if (!live.foreign.empty())
+            for (const auto& k : live.foreign)
+                res.foreignKeys.push_back({toHex(k.sha), k.va, k.fileOff, true});
+        else
             for (const auto& c : cands)
-                std::cout << "    fileOff=0x" << std::hex << c.offset << std::dec
-                          << "  sha256=" << toHex(c.sha) << "   (share to blocklist)\n";
-        }
-        std::cout << "full-file sha256: " << fileSha << "\n";
-        return 2;
+                res.foreignKeys.push_back({toHex(c.sha), 0, c.offset, false});
+        return res;
     }
 
     // 4) No genuine key, no recognizable foreign key.
-    banner("UNKNOWN", "No recognizable Warden key found - treat with caution.");
-    std::cout << "Could be a heavily modified, packed, or non-standard client. The Warden key\n"
-                 "could not be located to verify it. Prefer an official client from a source you trust.\n";
-    std::cout << "full-file sha256: " << fileSha << "\n";
-    return 3;
+    res.verdict = "UNKNOWN"; res.exitCode = 3;
+    res.reason = "No recognizable Warden key found - treat with caution.";
+    res.detail = "Could be a heavily modified, packed, or non-standard client; the Warden key could "
+                 "not be located to verify it. Prefer an official client from a source you trust.";
+    return res;
+}
+
+static void renderHuman(const ScanResult& res) {
+    std::cout << "\n========================================\n"
+              << "  VERDICT: " << res.verdict << "\n"
+              << "  " << res.reason << "\n"
+              << "========================================\n";
+    if (!res.detail.empty()) std::cout << res.detail << "\n";
+    if (res.matchedManifest) std::cout << "matched         : community known-good manifest\n";
+    if (res.keyPresent && res.reversedMatch)
+        std::cout << "note            : key matched in reversed byte order (LE/BE storage variant).\n";
+    if (res.keyPresent && res.verdict == "SAFE")
+        std::cout << "live-key xref   : " << res.liveKey << "\n";
+    if (!res.foreignKeys.empty()) {
+        std::cout << "foreign key(s)  :\n";
+        for (const auto& k : res.foreignKeys) {
+            std::cout << "    ";
+            if (k.codeReferenced) std::cout << "VA=0x" << std::hex << k.va << " ";
+            std::cout << "fileOff=0x" << std::hex << k.fileOff << std::dec
+                      << (k.codeReferenced ? "  code-referenced" : "")
+                      << "  sha256=" << k.sha << "   (share to blocklist)\n";
+        }
+    }
+    std::cout << "full-file sha256: " << res.fileSha << "\n";
+}
+
+static void renderJson(const ScanResult& res) {
+    auto esc = [](const std::string& s){
+        std::string o; o.reserve(s.size()+8);
+        for (char c : s) { if (c=='"'||c=='\\') o.push_back('\\'); o.push_back(c); }
+        return o;
+    };
+    std::cout << "{";
+    std::cout << "\"verdict\":\"" << res.verdict << "\",";
+    std::cout << "\"exit_code\":" << res.exitCode << ",";
+    std::cout << "\"file_sha256\":\"" << res.fileSha << "\",";
+    std::cout << "\"pinned\":" << (res.pinned ? "true" : "false") << ",";
+    std::cout << "\"key_present\":" << (res.keyPresent ? "true" : "false") << ",";
+    std::cout << "\"reversed_match\":" << (res.reversedMatch ? "true" : "false") << ",";
+    std::cout << "\"live_key\":\"" << res.liveKey << "\",";
+    std::cout << "\"matched_good_hash\":" << (res.matchedGoodHash ? "true" : "false") << ",";
+    std::cout << "\"matched_manifest\":" << (res.matchedManifest ? "true" : "false") << ",";
+    std::cout << "\"reason\":\"" << esc(res.reason) << "\",";
+    std::cout << "\"foreign_keys\":[";
+    for (size_t i = 0; i < res.foreignKeys.size(); ++i) {
+        const auto& k = res.foreignKeys[i];
+        std::cout << (i ? "," : "") << "{\"sha256\":\"" << k.sha << "\","
+                  << "\"code_referenced\":" << (k.codeReferenced ? "true" : "false") << ","
+                  << "\"va\":" << k.va << ",\"file_offset\":" << k.fileOff << "}";
+    }
+    std::cout << "]}";
+    std::cout << "\n";
+}
+
+static int cmdScan(const std::vector<uint8_t>& b, const std::string& refPath,
+                   const std::string& manifestPath, bool json) {
+    Reference r = loadRef(refPath);
+    const auto manHashes = loadManifestGoodHashes(manifestPath);
+    for (const auto& h : manHashes)
+        if (std::find(r.goodHashes.begin(), r.goodHashes.end(), h) == r.goodHashes.end())
+            r.goodHashes.push_back(h);
+
+    const ScanResult res = computeScan(b, r, manHashes);
+    if (json) renderJson(res); else renderHuman(res);
+    return res.exitCode;
 }
 
 // =============================================================================
@@ -865,6 +966,40 @@ static int cmdSelfTest() {
     const auto found = std::search(b.begin(), b.end(), mod.begin(), mod.end());
     check(found != b.end(), "std::search: genuine modulus is findable by content");
 
+    // 3) Exact-key extraction: the code-referenced key resolves to the TRUE key
+    //    start (modRaw), not the heuristic window - this is what makes a pin
+    //    byte-exact and therefore portable across builds.
+    const auto live = scanCodeReferencedKeys(b, pe, 0, 0);
+    check(live.foreign.size() == 1, "scanCodeReferencedKeys: exactly one code-referenced key");
+    if (!live.foreign.empty()) {
+        check(live.foreign[0].fileOff == modRaw, "code-referenced key offset is the EXACT key start");
+        check(std::equal(mod.begin(), mod.end(), b.begin() + live.foreign[0].fileOff),
+              "code-referenced bytes equal the planted modulus");
+    }
+
+    // 4) Verdict logic via computeScan against an in-memory reference.
+    {
+        Reference rg; rg.modulus = mod; rg.modulusSha = toHex(sha::sha256(mod.data(), mod.size()));
+        const ScanResult sr = computeScan(b, rg, {});
+        check(sr.verdict == "SAFE" && sr.exitCode == 0, "computeScan: genuine pinned key -> SAFE");
+        check(sr.liveKey == "genuine", "computeScan: live-key resolved to genuine");
+
+        std::vector<uint8_t> other(MOD_BYTES);
+        for (size_t i = 0; i < MOD_BYTES; ++i) other[i] = uint8_t((i * 53 + 7) ^ 0xA5);
+        other[0] |= 0x80; other[MOD_BYTES-1] |= 0x01;
+        Reference rf; rf.modulus = other; rf.modulusSha = toHex(sha::sha256(other.data(), other.size()));
+        const ScanResult df = computeScan(b, rf, {});
+        check(df.verdict == "DANGER" && df.exitCode == 2, "computeScan: foreign pinned key -> DANGER");
+
+        Reference rh; rh.goodHashes.push_back(toHex(sha::sha256(b.data(), b.size())));
+        const ScanResult hs = computeScan(b, rh, rh.goodHashes);
+        check(hs.verdict == "SAFE" && hs.matchedManifest, "computeScan: manifest hash match -> SAFE");
+
+        Reference re; // empty (no pin)
+        const ScanResult un = computeScan(b, re, {});
+        check(un.verdict == "UNKNOWN" && !un.pinned, "computeScan: no pin -> UNKNOWN");
+    }
+
     std::cout << (failed ? "\nSELFTEST: FAILED (" : "\nSELFTEST: PASSED (")
               << failed << " failure" << (failed==1?"":"s") << ")\n";
     return failed ? 1 : 0;
@@ -887,7 +1022,8 @@ static void usage() {
     "    --ref <path>       reference store (default: wardencheck.ref)\n"
     "    --manifest <path>  community known-good hash list (default: wardencheck.manifest)\n"
     "    --offset <hexVA>   pin: read modulus from explicit virtual address\n"
-    "    --pick <N>         pin: choose candidate N if several were found\n\n"
+    "    --pick <N>         pin: choose candidate N if several were found\n"
+    "    --json             scan: emit one machine-readable JSON object (for bots/CI)\n\n"
     "  Exit codes: 0=SAFE  2=DANGER  3=UNKNOWN  1=usage/error\n\n"
     "  First-time setup: run `pin` once against a client you trust (verify its\n"
     "  full-file hash against community consensus). One pin covers all expansions\n"
@@ -925,6 +1061,7 @@ int main(int argc, char** argv) {
     std::string manifestPath = "wardencheck.manifest";
     std::optional<uint64_t> vaOverride;
     std::optional<int> pick;
+    bool json = false;
 
     auto fail = [&](const std::string& msg) -> int {
         std::cerr << msg << "\n";
@@ -938,6 +1075,7 @@ int main(int argc, char** argv) {
         else if (a == "--manifest" && i + 1 < args.size()) manifestPath = args[++i];
         else if (a == "--offset" && i + 1 < args.size())   vaOverride = std::strtoull(args[++i].c_str(), nullptr, 0);
         else if (a == "--pick" && i + 1 < args.size())     pick = std::atoi(args[++i].c_str());
+        else if (a == "--json")                            json = true;
         else if (!a.empty() && a[0] != '-')                file = a;
         else return fail("error: unknown/malformed option '" + a + "'");
     }
@@ -950,7 +1088,7 @@ int main(int argc, char** argv) {
     if (!buf) return fail("error: cannot read file: " + file);
 
     int rc;
-    if      (cmd == "scan")    rc = cmdScan(*buf, refPath, manifestPath);
+    if      (cmd == "scan")    rc = cmdScan(*buf, refPath, manifestPath, json);
     else if (cmd == "pin")     rc = cmdPin(*buf, refPath, vaOverride, pick);
     else if (cmd == "addgood") rc = cmdAddGood(*buf, refPath);
     else if (cmd == "info")    rc = cmdInfo(*buf);
