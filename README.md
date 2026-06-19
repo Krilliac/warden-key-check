@@ -1,5 +1,7 @@
 # wardencheck
 
+[![build](https://github.com/Krilliac/warden-key-check/actions/workflows/build.yml/badge.svg)](https://github.com/Krilliac/warden-key-check/actions/workflows/build.yml)
+
 A single-file C++17 integrity checker for World of Warcraft client binaries
 (vanilla **1.12.1** → WotLK **3.3.5a**). It answers one question:
 
@@ -33,6 +35,18 @@ once via trust-on-first-use:
    consensus** before pinning.
 2. `wardencheck pin <that-client>` extracts the real modulus and stores it.
 3. Because the key is shared, that single pin covers every expansion.
+
+## Download
+
+Prebuilt binaries are attached to each [release](https://github.com/Krilliac/warden-key-check/releases/latest)
+(built by CI, self-test verified on every platform). Direct links for the latest release:
+
+- Windows x64: `https://github.com/Krilliac/warden-key-check/releases/latest/download/wardencheck-windows-x64.exe`
+- Windows x86: `https://github.com/Krilliac/warden-key-check/releases/latest/download/wardencheck-windows-x86.exe`
+- Linux x64:   `https://github.com/Krilliac/warden-key-check/releases/latest/download/wardencheck-linux-x64`
+- macOS arm64: `https://github.com/Krilliac/warden-key-check/releases/latest/download/wardencheck-macos-arm64`
+
+Windows users can just drag a `WoW.exe` onto the downloaded `.exe`. Or build from source:
 
 ## Build
 
