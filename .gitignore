@@ -1,0 +1,9 @@
+# Build artifacts
+wardencheck
+wardencheck.exe
+*.o
+*.obj
+
+# Reference store generated at runtime
+wardencheck.ref
+*.ref
