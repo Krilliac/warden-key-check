@@ -52,16 +52,42 @@ inline.
 wardencheck pin     <trusted-WoW.exe>   # establish reference from a trusted client
 wardencheck scan    <WoW.exe>           # verdict: SAFE / DANGER / UNKNOWN
 wardencheck addgood <trusted-WoW.exe>   # add a known-good full-file hash
-wardencheck info    <WoW.exe>           # diagnostic dump (sections, candidates)
+wardencheck info    <WoW.exe>           # diagnostic dump (sections, candidates, xrefs)
+wardencheck selftest                    # run built-in self-checks (no file needed)
 ```
+
+**Drag-and-drop:** drop a `WoW.exe` onto the `wardencheck` executable (or
+double-click and pass a path) and it runs `scan` automatically, keeping the
+console window open until you press Enter. It stays a terminal tool — no GUI
+dependency — but non-technical players never have to touch a command line.
 
 Options:
 
-| Option            | Meaning                                                      |
-|-------------------|-------------------------------------------------------------|
-| `--ref <path>`    | reference store (default: `wardencheck.ref`)                |
-| `--offset <hexVA>`| pin: read the modulus from an explicit virtual address      |
-| `--pick <N>`      | pin: choose candidate N when several are found              |
+| Option             | Meaning                                                       |
+|--------------------|---------------------------------------------------------------|
+| `--ref <path>`     | reference store (default: `wardencheck.ref`)                  |
+| `--manifest <path>`| community known-good hash list (default: `wardencheck.manifest`) |
+| `--offset <hexVA>` | pin: read the modulus from an explicit virtual address        |
+| `--pick <N>`       | pin: choose candidate N when several are found                |
+
+### Known-good manifest
+
+`scan` automatically loads `wardencheck.manifest` (a shippable, community-curated
+list of full-file SHA-256s) alongside your local pinned ref, so a recognized
+build returns SAFE instantly without pinning. The file ships **empty** — see the
+honesty note below — and is populated from community consensus. Point at your own
+with `--manifest`.
+
+### Live-key cross-reference (which key is actually wired in?)
+
+Beyond checking that the genuine key is *present*, `scan` follows `imm32`
+operands in executable sections to the bytes they point at and classifies them.
+This catches the **"embed both keys, route to mine"** evasion: if the genuine
+modulus is present but executable code references a *different* modulus and never
+the genuine one, the verdict is **DANGER**. This is a lightweight heuristic, not
+a full disassembler — it won't see indirect/computed addressing, so the *absence*
+of a genuine xref is treated as inconclusive (never as a tamper signal). Only a
+*positive* reference to a foreign key escalates the verdict.
 
 ## Verdicts and exit codes
 
@@ -83,16 +109,33 @@ self-sufficient.
 
 ## Honesty caveats
 
-- It checks whether the genuine key is *present*, not which key the Warden code
-  path is actually wired to. A paranoid attacker could embed both keys and route
-  to theirs. Catching that needs disassembly of the verify routine (a v2 item).
+- The live-key cross-reference covers *direct* (`imm32`) key references only.
+  Indirect or computed addressing won't be seen, so a missing genuine xref is
+  inconclusive — wardencheck escalates to DANGER only on a *positive* reference
+  to a foreign key, never on the absence of a genuine one. A full confirmation
+  still needs disassembly of the verify routine.
 - The heuristic locator is tuned to **never miss** a key (lenient thresholds);
   false positives are harmless because `pin` lets you confirm with `--pick`.
+- The manifest ships empty by design (see below) — wardencheck never asserts a
+  build is "known-good" on a hash it cannot stand behind.
+
+## Self-test
+
+`wardencheck selftest` runs deterministic checks of the security-critical
+primitives (SHA-256 known-answer vectors, the PE32 parser, VA↔file-offset
+mapping, the code-xref counter, and the modulus locator) against an in-memory
+synthetic PE. Exit code `0` means all checks passed — handy as a CI smoke test.
+
+## Implemented in this version
+
+- **Live-key cross-reference** — follows code pointers to confirm which modulus
+  the verify path actually reads (catches the dual-key decoy).
+- **Known-good manifest** — a distributable hash list so most users never pin
+  (see `wardencheck.manifest`).
+- **Drag-and-drop** — drop a `WoW.exe` onto the executable; stays terminal-based.
 
 ## Roadmap ideas
 
-- Follow the cross-reference from the Warden signature-verify call site to
-  confirm which modulus is actually *live*.
-- A bundled known-good hash manifest for common 5875 / 8606 / 12340 locale
-  builds so most users never need to pin.
-- A small drag-and-drop GUI wrapper for non-technical players.
+- Full disassembly of the signature-verify call site (vs. the current
+  direct-reference heuristic) to follow indirect addressing.
+- Populating the community manifest for common 5875 / 8606 / 12340 locale builds.

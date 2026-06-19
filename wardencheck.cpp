@@ -52,6 +52,7 @@
 #include <optional>
 #include <cmath>
 #include <cstring>
+#include <unordered_set>
 
 // =============================================================================
 // SHA-256 (FIPS 180-4). Used for full-file allow-listing and modulus fingerprints.
@@ -187,7 +188,9 @@ static std::optional<uint32_t> rd32(const std::vector<uint8_t>& b, size_t o) {
 // =============================================================================
 struct Section {
     std::string name;
-    uint32_t rva = 0, vsize = 0, fileOff = 0, rawSize = 0;
+    uint32_t rva = 0, vsize = 0, fileOff = 0, rawSize = 0, characteristics = 0;
+    // IMAGE_SCN_CNT_CODE (0x20) or IMAGE_SCN_MEM_EXECUTE (0x20000000) => holds code.
+    bool executable() const { return (characteristics & 0x20000020u) != 0; }
 };
 struct PEInfo {
     bool ok = false;
@@ -238,6 +241,7 @@ static PEInfo parsePE(const std::vector<uint8_t>& b) {
         s.rva     = rd32(b, so + 12).value_or(0);
         s.rawSize = rd32(b, so + 16).value_or(0);
         s.fileOff = rd32(b, so + 20).value_or(0);
+        s.characteristics = rd32(b, so + 36).value_or(0);
         pe.sections.push_back(s);
     }
 
@@ -269,6 +273,54 @@ static std::optional<size_t> vaToFileOffset(const PEInfo& pe, const std::vector<
     }
     return std::nullopt;
 }
+
+// Inverse mapping: file offset -> virtual address (imageBase + rva).
+static std::optional<uint32_t> fileOffsetToVA(const PEInfo& pe, size_t off) {
+    if (!pe.ok) return std::nullopt;
+    for (const auto& s : pe.sections) {
+        if (s.rawSize == 0) continue;
+        if (off >= s.fileOff && off < size_t(s.fileOff) + s.rawSize)
+            return static_cast<uint32_t>(uint64_t(pe.imageBase) + s.rva + (off - s.fileOff));
+    }
+    return std::nullopt;
+}
+
+// =============================================================================
+// Lightweight code cross-reference ("is this key the LIVE one?").
+//
+// This is NOT a disassembler. WoW's signature-verify path loads the modulus by
+// its absolute address, which appears in code as a little-endian imm32 operand
+// (e.g. `push offset modulus` / `mov reg, offset modulus`). We count windows in
+// executable sections whose 4 bytes equal the key buffer's VA. A nonzero count
+// is strong evidence the key at that VA is the one the verify routine reads.
+//
+// Honest about its limits: indirect/computed addressing won't be caught, so a
+// count of 0 is INCONCLUSIVE (not proof the key is dead). A POSITIVE reference
+// to a FOREIGN key while the genuine key is unreferenced is the meaningful red
+// flag (the "embed both, route to mine" evasion). We only escalate on that
+// positive signal, never on an absence.
+// =============================================================================
+// Count imm32 operands in executable sections whose value lands in [vaLo, vaHi).
+static size_t countCodeRefsIntoRange(const std::vector<uint8_t>& b, const PEInfo& pe,
+                                     uint32_t vaLo, uint32_t vaHi) {
+    size_t count = 0;
+    for (const auto& s : pe.sections) {
+        if (!s.executable() || s.rawSize == 0) continue;
+        const size_t lo = s.fileOff;
+        const size_t hi = std::min<size_t>(size_t(s.fileOff) + s.rawSize, b.size());
+        if (lo + 4 > hi) continue;
+        for (size_t i = lo; i + 4 <= hi; ++i) {
+            const uint32_t v = uint32_t(b[i]) | (uint32_t(b[i+1])<<8) |
+                               (uint32_t(b[i+2])<<16) | (uint32_t(b[i+3])<<24);
+            if (v >= vaLo && v < vaHi) ++count;
+        }
+    }
+    return count;
+}
+static size_t countCodeRefsToVA(const std::vector<uint8_t>& b, const PEInfo& pe, uint32_t va) {
+    return countCodeRefsIntoRange(b, pe, va, va + 1);
+}
+
 
 // =============================================================================
 // RSA-2048 modulus heuristic locator.
@@ -342,6 +394,69 @@ static std::vector<Candidate> findModulusCandidates(const std::vector<uint8_t>& 
     return out;
 }
 
+// Same shape/entropy test as the locator, but at one FIXED offset (used when we
+// follow a code pointer to see whether it lands on a modulus).
+static bool isModulusShapedAt(const std::vector<uint8_t>& b, size_t off) {
+    if (off + MOD_BYTES > b.size()) return false;
+    int counts[256] = {0}; int distinct = 0;
+    for (size_t i = 0; i < MOD_BYTES; ++i)
+        if (counts[b[off + i]]++ == 0) ++distinct;
+    const uint8_t first = b[off], last = b[off + MOD_BYTES - 1];
+    const bool le = (first & 1) && (last & 0x80);
+    const bool be = (last  & 1) && (first & 0x80);
+    if (!le && !be) return false;
+    if (distinct < DISTINCT_MIN) return false;
+    return windowEntropy(counts) >= ENTROPY_MIN;
+}
+
+// =============================================================================
+// Live-key resolution: follow every imm32 operand in executable code to the
+// bytes it points at, and classify those bytes. This is precise (we test the
+// exact pointed-to 256 bytes, no offset guessing) and directly answers "which
+// key does the code reference?" - the question the simple content scan cannot.
+// =============================================================================
+struct CodeKeyRef { uint32_t va; size_t fileOff; std::array<uint8_t,32> sha; };
+struct LiveKeyScan {
+    bool   genuineReferenced = false;   // code points into the genuine key span
+    size_t genuineRefCount   = 0;
+    std::vector<CodeKeyRef> foreign;    // distinct shaped keys code points at, elsewhere
+};
+// genuineLoVA/HiVA: VA span of the genuine modulus as located in THIS binary
+// (from a content search). A code pointer landing inside it is the genuine key.
+// We classify by span membership, not exact byte equality, because the located
+// window can be a few filler bytes off from the true key start - a pointer to
+// the real start would otherwise be misread as a foreign key (false DANGER).
+// Foreign classification requires the pointed-to bytes to actually be modulus-
+// shaped, so coincidental data pointers cannot manufacture a DANGER verdict.
+static LiveKeyScan scanCodeReferencedKeys(const std::vector<uint8_t>& b, const PEInfo& pe,
+                                          uint32_t genuineLoVA, uint32_t genuineHiVA) {
+    LiveKeyScan r;
+    if (!pe.ok) return r;
+    const bool haveGenuine = genuineHiVA > genuineLoVA;
+    std::unordered_set<uint32_t> seen;     // dedupe identical operand values
+    for (const auto& s : pe.sections) {
+        if (!s.executable() || s.rawSize == 0) continue;
+        const size_t lo = s.fileOff;
+        const size_t hi = std::min<size_t>(size_t(s.fileOff) + s.rawSize, b.size());
+        for (size_t i = lo; i + 4 <= hi; ++i) {
+            const uint32_t v = uint32_t(b[i]) | (uint32_t(b[i+1])<<8) |
+                               (uint32_t(b[i+2])<<16) | (uint32_t(b[i+3])<<24);
+            if (v < pe.imageBase) continue;       // not a plausible VA
+            if (!seen.insert(v).second) continue; // already classified this value
+            if (haveGenuine && v >= genuineLoVA && v < genuineHiVA) {
+                r.genuineReferenced = true; ++r.genuineRefCount; continue;
+            }
+            const auto off = vaToFileOffset(pe, b, v);
+            if (!off || !isModulusShapedAt(b, *off)) continue;
+            CodeKeyRef k{v, *off, sha::sha256(b.data() + *off, MOD_BYTES)};
+            if (std::none_of(r.foreign.begin(), r.foreign.end(),
+                             [&](const CodeKeyRef& e){ return e.sha == k.sha; }))
+                r.foreign.push_back(k);
+        }
+    }
+    return r;
+}
+
 // =============================================================================
 // Reference store (plain text; trivially auditable, no JSON dependency).
 //   MODULUS=<512 hex>           the trusted Blizzard Warden modulus (256 bytes)
@@ -390,6 +505,41 @@ static bool saveRef(const std::string& path, const Reference& r) {
 }
 
 // =============================================================================
+// Distributable known-good manifest (optional, shipped alongside the binary).
+//
+// Same line format as the reference store but intended to be community-curated
+// and version-controlled, so most users get an instant SAFE verdict without
+// pinning. Lines starting with '#' are comments; only GOODHASH lines are read
+// (a single trusted modulus still belongs in the user's own pinned ref).
+//
+// HONESTY: this project ships the manifest as a TEMPLATE with documented build
+// slots and NO hashes filled in. We do not bake in unverified constants - a
+// wrong "known-good" hash is a false "you're safe". Maintainers populate it
+// from community consensus; users can point at their own with --manifest.
+// =============================================================================
+static std::vector<std::string> loadManifestGoodHashes(const std::string& path) {
+    std::vector<std::string> out;
+    std::ifstream f(path);
+    if (!f) return out;
+    std::string line;
+    while (std::getline(f, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        size_t b0 = line.find_first_not_of(" \t");
+        if (b0 == std::string::npos || line[b0] == '#') continue;
+        const size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        if (line.substr(0, eq) == "GOODHASH") {
+            std::string val = line.substr(eq + 1);
+            // tolerate trailing inline comments / whitespace
+            size_t sp = val.find_first_of(" \t#");
+            if (sp != std::string::npos) val = val.substr(0, sp);
+            if (val.size() == 64) out.push_back(val);
+        }
+    }
+    return out;
+}
+
+// =============================================================================
 // Commands
 // =============================================================================
 static int cmdInfo(const std::vector<uint8_t>& b) {
@@ -414,6 +564,14 @@ static int cmdInfo(const std::vector<uint8_t>& b) {
         std::cout << "    fileOff=0x" << std::hex << c.offset << std::dec
                   << "  " << c.endian << "  H=" << c.entropy
                   << "  sha256=" << toHex(c.sha) << "\n";
+
+    // Code-referenced keys: follow imm32 operands in executable sections to any
+    // modulus-shaped bytes they point at (no genuine span here - purely a dump).
+    const auto live = scanCodeReferencedKeys(b, pe, 0, 0);
+    std::cout << "Code-referenced keys (imm32 -> modulus): " << live.foreign.size() << "\n";
+    for (const auto& k : live.foreign)
+        std::cout << "    VA=0x" << std::hex << k.va << " fileOff=0x" << k.fileOff << std::dec
+                  << "  sha256=" << toHex(k.sha) << "\n";
     return 0;
 }
 
@@ -492,8 +650,15 @@ static int cmdAddGood(const std::vector<uint8_t>& b, const std::string& refPath)
     return 0;
 }
 
-static int cmdScan(const std::vector<uint8_t>& b, const std::string& refPath) {
-    const Reference r = loadRef(refPath);
+static int cmdScan(const std::vector<uint8_t>& b, const std::string& refPath,
+                   const std::string& manifestPath) {
+    Reference r = loadRef(refPath);
+    // Fold in distributable manifest hashes so most users never have to pin.
+    const auto manHashes = loadManifestGoodHashes(manifestPath);
+    for (const auto& h : manHashes)
+        if (std::find(r.goodHashes.begin(), r.goodHashes.end(), h) == r.goodHashes.end())
+            r.goodHashes.push_back(h);
+
     const std::string fileSha = toHex(sha::sha256(b.data(), b.size()));
 
     auto banner = [](const char* v, const char* msg){
@@ -503,9 +668,13 @@ static int cmdScan(const std::vector<uint8_t>& b, const std::string& refPath) {
                   << "========================================\n";
     };
 
-    // 1) Strongest positive signal: exact match against a known-good client.
+    // 1) Strongest positive signal: exact match against a known-good client
+    //    (from the pinned ref or the community manifest).
     if (std::find(r.goodHashes.begin(), r.goodHashes.end(), fileSha) != r.goodHashes.end()) {
         banner("SAFE", "Exact match to a known-good client. Warden key is genuine.");
+        if (!manHashes.empty() &&
+            std::find(manHashes.begin(), manHashes.end(), fileSha) != manHashes.end())
+            std::cout << "matched         : community known-good manifest\n";
         std::cout << "full-file sha256: " << fileSha << "\n";
         return 0;
     }
@@ -520,34 +689,76 @@ static int cmdScan(const std::vector<uint8_t>& b, const std::string& refPath) {
         return 3;
     }
 
+    const PEInfo pe = parsePE(b);
+
     // 2) Content search: is the genuine Blizzard modulus embedded anywhere?
     //    Version-agnostic by design (we match the key, not a fixed offset).
     const auto it = std::search(b.begin(), b.end(), r.modulus.begin(), r.modulus.end());
-    if (it != b.end()) {
-        const bool pristine = false; // hash already known not in allow-list
+    const bool genuinePresent = (it != b.end());
+
+    // Precise live-key resolution: follow code pointers to the keys they read.
+    // Establish the genuine key's VA span (if present) so pointers into it are
+    // recognized as the genuine key rather than misread as foreign.
+    uint32_t genuineLoVA = 0, genuineHiVA = 0;
+    if (genuinePresent) {
+        const size_t goff = static_cast<size_t>(it - b.begin());
+        if (auto va = fileOffsetToVA(pe, goff)) { genuineLoVA = *va; genuineHiVA = *va + MOD_BYTES; }
+    }
+    const LiveKeyScan live = scanCodeReferencedKeys(b, pe, genuineLoVA, genuineHiVA);
+
+    if (genuinePresent) {
+        // 2a) Decoy / dual-key evasion: the genuine key is present, but executable
+        //     code references a DIFFERENT modulus and NOT the genuine one. We
+        //     escalate only on this POSITIVE foreign reference - an absent genuine
+        //     xref alone is inconclusive (indirect addressing is normal).
+        if (!live.foreign.empty() && !live.genuineReferenced) {
+            banner("DANGER", "Genuine key is present but a FOREIGN key is wired in. Do NOT connect.");
+            std::cout << "The legitimate modulus exists in the file, yet executable code references a\n"
+                         "different RSA-2048 key and never the genuine one. This is the 'embed both,\n"
+                         "route to mine' pattern - the live verify path uses the attacker's key.\n";
+            std::cout << "code-referenced foreign key(s):\n";
+            for (const auto& k : live.foreign)
+                std::cout << "    VA=0x" << std::hex << k.va << " fileOff=0x" << k.fileOff << std::dec
+                          << "  sha256=" << toHex(k.sha) << "   (share to blocklist)\n";
+            std::cout << "full-file sha256 : " << fileSha << "\n";
+            return 2;
+        }
+
         banner("SAFE", "Genuine Blizzard Warden key is embedded in this client.");
         std::cout << "Warden RSA key  : MATCHES trusted reference (server cannot forge modules).\n";
-        if (!pristine)
-            std::cout << "Note            : full-file hash is not in your known-good list, so the\n"
-                         "                  client is modified (e.g. VanillaFixes/SuperWoW-style patch),\n"
-                         "                  but the Warden key itself is intact.\n";
+        if (live.genuineReferenced)
+            std::cout << "live-key xref   : code references the genuine key directly (it is the key\n"
+                         "                  the verify path reads) and no foreign key is referenced.\n";
+        else
+            std::cout << "live-key xref   : none found (inconclusive - indirect addressing is normal;\n"
+                         "                  no foreign key is referenced either, so no tamper signal).\n";
+        std::cout << "Note            : full-file hash is not in your known-good list, so the\n"
+                     "                  client is modified (e.g. VanillaFixes/SuperWoW-style patch),\n"
+                     "                  but the Warden key itself is intact.\n";
         std::cout << "full-file sha256: " << fileSha << "\n";
         return 0;
     }
 
     // 3) Blizzard key absent. Is a *foreign* RSA-2048 key sitting where the
     //    Warden key belongs? That is the RCE-enabling tamper.
-    const PEInfo pe = parsePE(b);
     const auto cands = findModulusCandidates(b, pe.rdataLo, pe.rdataHi);
-    if (!cands.empty()) {
+    if (!cands.empty() || !live.foreign.empty()) {
         banner("DANGER", "Warden key was REPLACED. Do NOT connect with this client.");
         std::cout << "The genuine Blizzard key is absent and a different RSA-2048 key is embedded.\n"
                      "A server using this client can sign and EXECUTE arbitrary native code on your\n"
                      "machine (remote code execution). Only use the official client for this server.\n";
         std::cout << "foreign key(s)  :\n";
-        for (const auto& c : cands)
-            std::cout << "    fileOff=0x" << std::hex << c.offset << std::dec
-                      << "  sha256=" << toHex(c.sha) << "   (share to blocklist)\n";
+        // Prefer code-referenced keys (precise); fall back to content candidates.
+        const auto& list = !live.foreign.empty() ? live.foreign : std::vector<CodeKeyRef>{};
+        if (!list.empty()) {
+            for (const auto& k : list)
+                std::cout << "    VA=0x" << std::hex << k.va << " fileOff=0x" << k.fileOff << std::dec
+                          << "  code-referenced  sha256=" << toHex(k.sha) << "   (share to blocklist)\n";
+        } else {
+            for (const auto& c : cands)
+                std::cout << "    fileOff=0x" << std::hex << c.offset << std::dec
+                          << "  sha256=" << toHex(c.sha) << "   (share to blocklist)\n";
+        }
         std::cout << "full-file sha256: " << fileSha << "\n";
         return 2;
     }
@@ -561,6 +772,105 @@ static int cmdScan(const std::vector<uint8_t>& b, const std::string& refPath) {
 }
 
 // =============================================================================
+// Self-test: deterministic checks of the security-critical primitives. No I/O,
+// no network; safe to run anywhere (CI smoke test). Exit 0 = all passed.
+// =============================================================================
+static int cmdSelfTest() {
+    int failed = 0;
+    auto check = [&](bool cond, const char* what){
+        std::cout << (cond ? "  ok   " : "  FAIL ") << what << "\n";
+        if (!cond) ++failed;
+    };
+
+    // 1) SHA-256 known-answer tests (FIPS 180-4).
+    {
+        const auto e = sha::sha256(reinterpret_cast<const uint8_t*>(""), 0);
+        check(toHex(e) == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "SHA-256(\"\")");
+        const std::string abc = "abc";
+        const auto a = sha::sha256(reinterpret_cast<const uint8_t*>(abc.data()), abc.size());
+        check(toHex(a) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+              "SHA-256(\"abc\")");
+    }
+
+    // 2) Build a minimal PE32 in memory with a modulus in .rdata and a planted
+    //    `push imm32` reference to that modulus's VA in an executable .text.
+    auto put16 = [](std::vector<uint8_t>& v, size_t o, uint16_t x){ v[o]=uint8_t(x); v[o+1]=uint8_t(x>>8); };
+    auto put32 = [](std::vector<uint8_t>& v, size_t o, uint32_t x){
+        v[o]=uint8_t(x); v[o+1]=uint8_t(x>>8); v[o+2]=uint8_t(x>>16); v[o+3]=uint8_t(x>>24); };
+
+    const uint32_t IMAGE_BASE = 0x00400000;
+    const size_t peoff = 0x40, optSize = 0xE0, optOff = peoff + 24;
+    const size_t secStart = optOff + optSize;
+
+    std::vector<uint8_t> mod(MOD_BYTES);
+    for (size_t i = 0; i < MOD_BYTES; ++i) mod[i] = uint8_t((i * 37 + 11) ^ (i >> 1)); // pseudo-random
+    mod[0] |= 0x80; mod[MOD_BYTES-1] |= 0x01;                                          // shape: BE top+odd
+
+    // .text raw and .rdata raw placement (512-aligned).
+    const size_t textRaw  = ((secStart + 2*40) + 0x1FF) & ~size_t(0x1FF);
+    const size_t textSize = 0x40;
+    const size_t rdataRaw = textRaw + 0x200;
+    const size_t fillerPre = 0x80;
+    const size_t modRaw = rdataRaw + fillerPre;
+    const size_t rdataSize = fillerPre + MOD_BYTES + 0x80;
+    const uint32_t textRVA = 0x1000, rdataRVA = 0x2000;
+    const uint32_t modVA = uint32_t(IMAGE_BASE + rdataRVA + fillerPre);
+
+    std::vector<uint8_t> b(rdataRaw + rdataSize, 0x00);
+    b[0] = 'M'; b[1] = 'Z';
+    put32(b, 0x3C, uint32_t(peoff));
+    put32(b, peoff, 0x00004550);
+    put16(b, peoff + 6, 2);            // NumberOfSections
+    put16(b, peoff + 20, uint16_t(optSize));
+    put16(b, optOff, 0x10B);          // PE32
+    put32(b, optOff + 28, IMAGE_BASE);
+    // .text header
+    {
+        const char* nm = ".text"; std::memcpy(b.data()+secStart, nm, 5);
+        put32(b, secStart + 8, textSize); put32(b, secStart + 12, textRVA);
+        put32(b, secStart + 16, uint32_t(textSize)); put32(b, secStart + 20, uint32_t(textRaw));
+        put32(b, secStart + 36, 0x60000020); // CNT_CODE|MEM_EXECUTE|MEM_READ
+    }
+    // .rdata header
+    {
+        const size_t so = secStart + 40;
+        const char* nm = ".rdata"; std::memcpy(b.data()+so, nm, 6);
+        put32(b, so + 8, uint32_t(rdataSize)); put32(b, so + 12, rdataRVA);
+        put32(b, so + 16, uint32_t(rdataSize)); put32(b, so + 20, uint32_t(rdataRaw));
+        put32(b, so + 36, 0x40000040); // CNT_INITIALIZED_DATA|MEM_READ
+    }
+    // plant code: push imm32 (0x68) <modVA LE>
+    b[textRaw] = 0x68; put32(b, textRaw + 1, modVA);
+    // copy filler + modulus
+    for (size_t i = 0; i < fillerPre; ++i) b[rdataRaw + i] = 0x11;
+    std::memcpy(b.data() + modRaw, mod.data(), MOD_BYTES);
+
+    const PEInfo pe = parsePE(b);
+    check(pe.ok, "parsePE: valid PE");
+    check(pe.imageBase == IMAGE_BASE, "parsePE: imageBase");
+    check(pe.sections.size() == 2, "parsePE: section count");
+    check(pe.rdataLo == rdataRaw && pe.rdataHi == rdataRaw + rdataSize, "parsePE: .rdata window");
+
+    if (auto va = fileOffsetToVA(pe, modRaw))
+        check(*va == modVA, "fileOffsetToVA(modulus) round-trip");
+    else check(false, "fileOffsetToVA returned nullopt");
+
+    check(countCodeRefsToVA(b, pe, modVA) == 1, "countCodeRefsToVA: finds planted push imm32");
+    check(countCodeRefsToVA(b, pe, modVA + 0x1234) == 0, "countCodeRefsToVA: no false positive");
+
+    const auto cands = findModulusCandidates(b, pe.rdataLo, pe.rdataHi);
+    check(!cands.empty(), "findModulusCandidates: locates a key in .rdata");
+
+    const auto found = std::search(b.begin(), b.end(), mod.begin(), mod.end());
+    check(found != b.end(), "std::search: genuine modulus is findable by content");
+
+    std::cout << (failed ? "\nSELFTEST: FAILED (" : "\nSELFTEST: PASSED (")
+              << failed << " failure" << (failed==1?"":"s") << ")\n";
+    return failed ? 1 : 0;
+}
+
+// =============================================================================
 // CLI
 // =============================================================================
 static void usage() {
@@ -569,9 +879,13 @@ static void usage() {
     "  wardencheck pin     <trusted-WoW.exe>   establish reference from a trusted client\n"
     "  wardencheck scan    <WoW.exe>           verdict: SAFE / DANGER / UNKNOWN\n"
     "  wardencheck addgood <trusted-WoW.exe>   add a known-good full-file hash\n"
-    "  wardencheck info    <WoW.exe>           diagnostic dump\n\n"
+    "  wardencheck info    <WoW.exe>           diagnostic dump\n"
+    "  wardencheck selftest                    run built-in self-checks (no file needed)\n\n"
+    "  Drag-and-drop: drop a WoW.exe onto the wardencheck executable to scan it\n"
+    "                 (the window stays open until you press Enter).\n\n"
     "  Options:\n"
     "    --ref <path>       reference store (default: wardencheck.ref)\n"
+    "    --manifest <path>  community known-good hash list (default: wardencheck.manifest)\n"
     "    --offset <hexVA>   pin: read modulus from explicit virtual address\n"
     "    --pick <N>         pin: choose candidate N if several were found\n\n"
     "  Exit codes: 0=SAFE  2=DANGER  3=UNKNOWN  1=usage/error\n\n"
@@ -580,36 +894,68 @@ static void usage() {
     "  because Blizzard reused the same Warden key across 1.12.1 / 2.4.3 / 3.3.5a.\n";
 }
 
+static bool isCommand(const std::string& s) {
+    return s == "pin" || s == "scan" || s == "addgood" || s == "info" ||
+           s == "selftest" || s == "help" || s == "-h" || s == "--help";
+}
+
+// Block until the user presses Enter, so a double-click / drag-and-drop console
+// window does not vanish before the verdict can be read.
+static void pauseForUser() {
+    std::cout << "\nPress Enter to close this window..." << std::flush;
+    std::string dummy;
+    std::getline(std::cin, dummy);
+}
+
 int main(int argc, char** argv) {
     std::vector<std::string> args(argv + 1, argv + argc);
     if (args.empty()) { usage(); return 1; }
 
-    const std::string cmd = args[0];
-    std::string file, refPath = "wardencheck.ref";
+    // Drag-and-drop / double-click: the first arg is a file path, not a verb.
+    // Default to `scan` and keep the console open afterwards.
+    bool dragDrop = false;
+    std::string cmd = args[0];
+    if (!isCommand(cmd) && !cmd.empty() && cmd[0] != '-') {
+        std::ifstream probe(cmd, std::ios::binary);
+        if (probe.good()) { dragDrop = true; args.insert(args.begin(), "scan"); cmd = "scan"; }
+    }
+
+    std::string file;
+    std::string refPath = "wardencheck.ref";
+    std::string manifestPath = "wardencheck.manifest";
     std::optional<uint64_t> vaOverride;
     std::optional<int> pick;
 
+    auto fail = [&](const std::string& msg) -> int {
+        std::cerr << msg << "\n";
+        if (dragDrop) pauseForUser();
+        return 1;
+    };
+
     for (size_t i = 1; i < args.size(); ++i) {
         const std::string& a = args[i];
-        if (a == "--ref" && i + 1 < args.size())        refPath = args[++i];
-        else if (a == "--offset" && i + 1 < args.size()) vaOverride = std::strtoull(args[++i].c_str(), nullptr, 0);
-        else if (a == "--pick" && i + 1 < args.size())   pick = std::atoi(args[++i].c_str());
-        else if (!a.empty() && a[0] != '-')              file = a;
-        else { std::cerr << "error: unknown/!malformed option '" << a << "'\n"; return 1; }
+        if (a == "--ref" && i + 1 < args.size())          refPath = args[++i];
+        else if (a == "--manifest" && i + 1 < args.size()) manifestPath = args[++i];
+        else if (a == "--offset" && i + 1 < args.size())   vaOverride = std::strtoull(args[++i].c_str(), nullptr, 0);
+        else if (a == "--pick" && i + 1 < args.size())     pick = std::atoi(args[++i].c_str());
+        else if (!a.empty() && a[0] != '-')                file = a;
+        else return fail("error: unknown/malformed option '" + a + "'");
     }
 
     if (cmd == "help" || cmd == "-h" || cmd == "--help") { usage(); return 0; }
+    if (cmd == "selftest") return cmdSelfTest();
 
     if (file.empty()) { std::cerr << "error: missing <WoW.exe> path\n"; usage(); return 1; }
     const auto buf = readFile(file);
-    if (!buf) { std::cerr << "error: cannot read file: " << file << "\n"; return 1; }
+    if (!buf) return fail("error: cannot read file: " + file);
 
-    if (cmd == "scan")    return cmdScan(*buf, refPath);
-    if (cmd == "pin")     return cmdPin(*buf, refPath, vaOverride, pick);
-    if (cmd == "addgood") return cmdAddGood(*buf, refPath);
-    if (cmd == "info")    return cmdInfo(*buf);
+    int rc;
+    if      (cmd == "scan")    rc = cmdScan(*buf, refPath, manifestPath);
+    else if (cmd == "pin")     rc = cmdPin(*buf, refPath, vaOverride, pick);
+    else if (cmd == "addgood") rc = cmdAddGood(*buf, refPath);
+    else if (cmd == "info")    rc = cmdInfo(*buf);
+    else return fail("error: unknown command '" + cmd + "'");
 
-    std::cerr << "error: unknown command '" << cmd << "'\n";
-    usage();
-    return 1;
+    if (dragDrop) pauseForUser();
+    return rc;
 }

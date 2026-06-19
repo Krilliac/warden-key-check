@@ -1,0 +1,26 @@
+# wardencheck community known-good manifest
+# ---------------------------------------------------------------------------
+# Full-file SHA-256 hashes of WoW.exe clients the community has verified as
+# clean (genuine Warden key, no RCE-enabling tamper). When `wardencheck scan`
+# finds an exact match here, it returns SAFE immediately - so most users never
+# need to run `pin` themselves.
+#
+# FORMAT
+#   GOODHASH=<64 lowercase hex>   # optional comment (build / locale / source)
+#   Lines starting with '#' are comments. Inline '#' comments are allowed.
+#
+# HONESTY / NO FABRICATED CONSTANTS
+#   This file ships EMPTY on purpose. A wrong "known-good" hash is a false
+#   "you're safe" verdict, so we never bake in unverified values. Only add a
+#   hash after the client's full-file SHA-256 is corroborated by independent
+#   community sources. Compute one with:  wardencheck info <WoW.exe>
+#
+# Common builds to populate (verify each against community consensus first):
+#   1.12.1  (build 5875)   enUS / enGB / deDE / frFR / ...
+#   2.4.3   (build 8606)   enUS / ...
+#   3.3.5a  (build 12340)  enUS / ...
+#
+# --- add verified hashes below this line ---
+# GOODHASH=<sha256 of 1.12.1 enUS WoW.exe>   # 1.12.1 build 5875 enUS
+# GOODHASH=<sha256 of 2.4.3  enUS WoW.exe>   # 2.4.3  build 8606 enUS
+# GOODHASH=<sha256 of 3.3.5a enUS WoW.exe>   # 3.3.5a build 12340 enUS
