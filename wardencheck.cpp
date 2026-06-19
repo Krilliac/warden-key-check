@@ -591,6 +591,10 @@ static int cmdPin(const std::vector<uint8_t>& b, const std::string& refPath,
         modulus.assign(b.begin() + *off, b.begin() + *off + MOD_BYTES);
         pinSource = "explicit VA";
         std::cout << "Pinned modulus from explicit VA, fileOff=0x" << std::hex << *off << std::dec << "\n";
+        if (!isModulusShapedAt(b, *off))
+            std::cerr << "warning: bytes at this VA are not RSA-2048-modulus-shaped (not 256B with the\n"
+                         "         top bit set, odd, and high entropy). Double-check the address - you\n"
+                         "         may be pinning the wrong region.\n";
     } else {
         // Prefer the EXACT key the verify code references: a code pointer lands
         // on the true key start, so these bytes are the real 256-byte modulus -
